@@ -17,7 +17,7 @@ class DemoUIPlugin(BasePlugin):
     plugin_version = "1.0.0"
 
     configs: list[type] = []
-    dependent_components: list[str] = ["neo-mofox-webui:service:plugin_ui"]
+    dependent_components: list[str] = ["neo-mofox-webui-extra:service:plugin_ui"]
 
     def get_components(self) -> list[type]:
         """返回插件组件类。"""
@@ -27,7 +27,7 @@ class DemoUIPlugin(BasePlugin):
         """插件加载后注册 UI 页面。"""
         from src.app.plugin_system.api.service_api import get_service  # type: ignore
 
-        service = get_service("neo-mofox-webui:service:plugin_ui")
+        service = get_service("neo-mofox-webui-extra:service:plugin_ui")
 
         # 注册 XML 页面（纯关键字参数，无需导入 WebUI 内部类型）
         # i18n_path 指向本插件自带的 i18n JSON bundle；前端拿到后会自动注册，

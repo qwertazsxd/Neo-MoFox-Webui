@@ -1,7 +1,7 @@
 """插件 UI 页面注册服务。
 
 提供给其他 Neo-MoFox 插件调用的 Service 接口，用于注册/卸载/查询插件 UI 页面。
-其他插件通过 get_service("neo-mofox-webui:service:plugin_ui") 获取此服务实例。
+其他插件通过 get_service("neo-mofox-webui-extra:service:plugin_ui") 获取此服务实例。
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ class PluginUIService(BaseService):
     """插件 UI 页面注册服务。
 
     暴露给其他 Neo-MoFox 插件的 Service 接口。
-    签名为 neo-mofox-webui:service:plugin_ui。
+    签名为 neo-mofox-webui-extra:service:plugin_ui。
     """
 
     name: str = "plugin_ui"

@@ -2,7 +2,7 @@
 
 **关联设计文档**: [`Neo-MoFox-WebUI-Plugin-Extension-Design.md`](../Neo-MoFox-WebUI-Plugin-Extension-Design.md:1)
 **目标版本**: v3.1.0
-**适用项目**: [`Neo-MoFox-Webui/Plugin/`](../../Plugin:1)（neo-mofox-webui 后端插件）
+**适用项目**: [`Neo-MoFox-Webui/Plugin/`](../../Plugin:1)（neo-mofox-webui-extra 后端插件）
 **作者**: MoFox Team
 **状态**: 实现方案稿
 
@@ -269,7 +269,7 @@ HTML 三件套提交后，Manager 在 `register` 阶段把每个相对路径转�
 
 落点：[`Plugin/components/services/plugin_ui_service.py`](../../Plugin/components/services/plugin_ui_service.py:1)。
 
-`BaseService` 子类，签名固定为 `neo-mofox-webui:service:plugin_ui`。其他 Neo-MoFox 插件通过 `get_service("neo-mofox-webui:service:plugin_ui")` 拿到实例并调用。
+`BaseService` 子类，签名固定为 `neo-mofox-webui-extra:service:plugin_ui`。其他 Neo-MoFox 插件通过 `get_service("neo-mofox-webui-extra:service:plugin_ui")` 拿到实例并调用。
 
 ### 5.1 类骨架
 
@@ -624,7 +624,7 @@ WebUI 插件 `on_plugin_loaded`：
 3. `PluginUIService` 在 `BaseService.__init__` 时已就绪
 4. **不预注册任何 page**——所有 page 都由调用方插件在自己的 `on_plugin_loaded` 中显式注册
 
-> **依赖声明**：调用方插件在 `manifest.json` 的 `dependencies.plugins` 里声明 `["neo-mofox-webui:>=1.0.0"]`，让插件加载器先加载 WebUI 插件，避免 `get_service` 找不到 `plugin_ui`。
+> **依赖声明**：调用方插件在 `manifest.json` 的 `dependencies.plugins` 里声明 `["neo-mofox-webui-extra:>=1.0.0"]`，让插件加载器先加载 WebUI 插件，避免 `get_service` 找不到 `plugin_ui`。
 
 ---
 

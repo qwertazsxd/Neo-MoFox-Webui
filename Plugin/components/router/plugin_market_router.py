@@ -16,6 +16,9 @@ from ...managers.plugin_market_manager import (
 )
 from ...storage.settings import SettingsStorage
 from ...utils.plugin_market_types import (
+    BatchInstallPlan,
+    BatchInstallRequest,
+    BatchMarketOperation,
     InstallPlan,
     InstallPlanRequest,
     MarketCapabilities,
@@ -154,6 +157,55 @@ class PluginMarketRouter(BaseRouter):
             except Exception as error:
                 logger.error(f"读取市场插件文档失败: {error}", exc_info=True)
                 raise HTTPException(status_code=500, detail="读取市场插件文档失败") from error
+
+        @self.app.post(
+            "/plugins/batch/install-plan",
+            response_model=BaseResponse[BatchInstallPlan],
+            dependencies=[VerifiedDep],
+            summary="生成批量插件安装计划",
+            description="校验勾选插件的市场最新版本，自动补齐依赖，但不执行写入。",
+        )
+        async def create_batch_install_plan(
+            request: BatchInstallRequest,
+        ) -> BaseResponse[BatchInstallPlan]:
+            try:
+                return BaseResponse.ok(
+                    await self._manager.create_batch_install_plan(request.plugin_ids)
+                )
+            except PluginMarketError as error:
+                raise HTTPException(status_code=400, detail=str(error)) from error
+
+        @self.app.post(
+            "/plugins/batch/install",
+            response_model=BaseResponse[BatchMarketOperation],
+            dependencies=[VerifiedDep],
+            status_code=202,
+            summary="创建批量插件安装任务",
+            description="服务端重新计算计划后，按依赖顺序串行安装或更新可执行项。",
+        )
+        async def install_plugins_batch(
+            request: BatchInstallRequest,
+        ) -> BaseResponse[BatchMarketOperation]:
+            try:
+                return BaseResponse.ok(
+                    await self._manager.start_batch_install(request.plugin_ids),
+                    message="批量安装任务已创建",
+                )
+            except PluginMarketError as error:
+                raise HTTPException(status_code=409, detail=str(error)) from error
+
+        @self.app.get(
+            "/batch-operations/{operation_id}",
+            response_model=BaseResponse[BatchMarketOperation],
+            dependencies=[VerifiedDep],
+            summary="读取批量插件安装状态",
+            description="返回批量任务的总体进度和逐项结果。",
+        )
+        async def get_batch_operation(operation_id: str) -> BaseResponse[BatchMarketOperation]:
+            try:
+                return BaseResponse.ok(self._manager.get_batch_operation(operation_id))
+            except PluginMarketError as error:
+                raise HTTPException(status_code=404, detail=str(error)) from error
 
         @self.app.post(
             "/plugins/{plugin_id}/install-plan",

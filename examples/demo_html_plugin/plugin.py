@@ -25,7 +25,7 @@ class DemoHTMLPlugin(BasePlugin):
     plugin_version = "1.0.0"
 
     configs: list[type] = []
-    dependent_components: list[str] = ["neo-mofox-webui:service:plugin_ui"]
+    dependent_components: list[str] = ["neo-mofox-webui-extra:service:plugin_ui"]
 
     def get_components(self) -> list[type]:
         """返回插件组件类。"""
@@ -40,7 +40,7 @@ class DemoHTMLPlugin(BasePlugin):
         """
         from src.app.plugin_system.api.service_api import get_service  # type: ignore
 
-        service = get_service("neo-mofox-webui:service:plugin_ui")
+        service = get_service("neo-mofox-webui-extra:service:plugin_ui")
 
         # 注册 HTML 页面
         # assets 中的路径相对于插件根目录

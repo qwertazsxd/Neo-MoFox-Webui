@@ -136,3 +136,55 @@ export interface MarketOperation {
   error_message: string | null
   result: MarketOperationResult | null
 }
+
+export type BatchItemSource = 'selected' | 'dependency'
+export type BatchItemStatus = 'planned' | 'running' | 'succeeded' | 'failed' | 'skipped' | 'blocked'
+export type BatchOperationStatus = 'queued' | 'running' | 'succeeded' | 'partial_failed' | 'failed'
+
+export interface BatchInstallPlanItem {
+  plugin_id: string
+  display_name: string
+  plugin: MarketPlugin | null
+  version: MarketVersion | null
+  action: 'install' | 'update' | null
+  source: BatchItemSource
+  dependencies: string[]
+  can_install: boolean
+  blocking_reasons: string[]
+  warnings: string[]
+}
+
+export interface BatchInstallPlan {
+  requested_plugin_ids: string[]
+  items: BatchInstallPlanItem[]
+  can_install: boolean
+  warnings: string[]
+}
+
+export interface BatchOperationItem {
+  plugin_id: string
+  display_name: string
+  version: string | null
+  action: 'install' | 'update' | null
+  source: BatchItemSource
+  dependencies: string[]
+  status: BatchItemStatus
+  message: string
+  error_message: string | null
+  restart_required: boolean
+}
+
+export interface BatchMarketOperation {
+  operation_id: string
+  status: BatchOperationStatus
+  stage: string
+  progress: number
+  message: string
+  created_at: string
+  updated_at: string
+  requested_count: number
+  success_count: number
+  failed_count: number
+  skipped_count: number
+  items: BatchOperationItem[]
+}

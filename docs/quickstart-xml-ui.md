@@ -55,8 +55,8 @@ XML 文档结构受 [`plugin_ui_v3_1.xsd`](../Plugin/utils/plugin_ui/schemas/plu
 ```json
 {
   "dependencies": {
-    "plugins": ["neo-mofox-webui"],
-    "components": ["neo-mofox-webui:service:plugin_ui"]
+    "plugins": ["neo-mofox-webui-extra"],
+    "components": ["neo-mofox-webui-extra:service:plugin_ui"]
   }
 }
 ```
@@ -64,10 +64,10 @@ XML 文档结构受 [`plugin_ui_v3_1.xsd`](../Plugin/utils/plugin_ui/schemas/plu
 - 插件类的 `dependent_components` 同步声明：
 
 ```python
-dependent_components: list[str] = ["neo-mofox-webui:service:plugin_ui"]
+dependent_components: list[str] = ["neo-mofox-webui-extra:service:plugin_ui"]
 ```
 
-> ❗ 不写这两处依赖，`get_service("neo-mofox-webui:service:plugin_ui")` 会拿不到东西。
+> ❗ 不写这两处依赖，`get_service("neo-mofox-webui-extra:service:plugin_ui")` 会拿不到东西。
 
 ---
 
@@ -109,7 +109,7 @@ class MyPlugin(BasePlugin):
     plugin_version = "1.0.0"
 
     configs: list[type] = []
-    dependent_components: list[str] = ["neo-mofox-webui:service:plugin_ui"]
+    dependent_components: list[str] = ["neo-mofox-webui-extra:service:plugin_ui"]
 
     def get_components(self) -> list[type]:
         return []
@@ -117,7 +117,7 @@ class MyPlugin(BasePlugin):
     async def on_plugin_loaded(self) -> None:
         from src.app.plugin_system.api.service_api import get_service
 
-        service = get_service("neo-mofox-webui:service:plugin_ui")
+        service = get_service("neo-mofox-webui-extra:service:plugin_ui")
 
         await service.register_ui_page(
             plugin_name="my_plugin",     # 必须与 plugin_name 一致

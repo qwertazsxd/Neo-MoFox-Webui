@@ -139,13 +139,19 @@ class LogRouter(BaseRouter):
         """注册日志相关的 API 端点。"""
 
         @self.app.websocket("/ws")
-        async def websocket_log_endpoint(websocket: WebSocket) -> None:
+        async def websocket_log_endpoint(
+            websocket: WebSocket,
+            plugin_name: str | None = Query(default=None, min_length=1, max_length=128),
+        ) -> None:
             """WebSocket 实时日志推送端点。
 
             客户端连接后将持续接收实时日志推送。
             支持的客户端消息：
             - {"type": "ping"} : 心跳
             - {"type": "set_level_filter", "levels": ["INFO", "ERROR"]} : 设置级别过滤
+
+            查询参数：
+            - plugin_name: 仅推送明确属于指定插件的日志
             """
             if not await verify_websocket_token(websocket):
                 return
@@ -160,7 +166,7 @@ class LogRouter(BaseRouter):
 
             try:
                 # 发送缓冲区中的历史日志（最近的）
-                recent_logs = log_mgr.get_buffer()
+                recent_logs = log_mgr.get_buffer(plugin_name=plugin_name)
                 if recent_logs:
                     await websocket.send_json({
                         "type": "history_batch",
@@ -174,6 +180,8 @@ class LogRouter(BaseRouter):
                         log_entry = await queue.get()
                         # 应用级别过滤
                         if level_filter and log_entry.get("level") not in level_filter:
+                            continue
+                        if not log_mgr.matches_plugin(log_entry, plugin_name):
                             continue
                         try:
                             await websocket.send_json({

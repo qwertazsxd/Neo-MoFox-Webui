@@ -7,8 +7,20 @@ import MdSelect from '../components/common/MdSelect.vue'
 import PageHeader from '../components/common/PageHeader.vue'
 import PluginMarketCard from '../components/plugin-market/PluginMarketCard.vue'
 import PluginMarketDetail from '../components/plugin-market/PluginMarketDetail.vue'
-import { getMarketPlugins } from '../api/modules/plugin-market'
-import type { MarketPlugin } from '../api/types/plugin-market'
+import {
+  getBatchMarketInstallPlan,
+  getBatchMarketOperation,
+  getMarketCapabilities,
+  getMarketPlugins,
+  startBatchMarketInstall,
+} from '../api/modules/plugin-market'
+import type {
+  BatchInstallPlan,
+  BatchMarketOperation,
+  MarketCapabilities,
+  MarketPlugin,
+} from '../api/types/plugin-market'
+import { useDialogStore } from '../utils/dialog'
 import { useI18n } from '../utils/i18n'
 
 type SelectOption = { label: string; value: string }
@@ -16,6 +28,7 @@ type MarketStateFilter = 'all' | 'installed' | 'updates' | 'not-installed'
 type MarketSort = 'updated' | 'downloads' | 'rating' | 'name'
 
 const { t } = useI18n()
+const dialog = useDialogStore()
 const route = useRoute()
 const router = useRouter()
 const plugins = ref<MarketPlugin[]>([])
@@ -26,11 +39,25 @@ const searchQuery = ref('')
 const category = ref('')
 const stateFilter = ref<MarketStateFilter>('all')
 const sortBy = ref<MarketSort>('updated')
+const capabilities = ref<MarketCapabilities | null>(null)
+const batchMode = ref(false)
+const selectedPluginIds = ref<string[]>([])
+const isPlanningBatch = ref(false)
+const batchOperation = ref<BatchMarketOperation | null>(null)
 
 const selectedPluginId = computed(() => {
   const value = route.query.plugin
   return typeof value === 'string' ? value : ''
 })
+
+const batchSelectionCount = computed(() => selectedPluginIds.value.length)
+const selectedPlugins = computed(() => selectedPluginIds.value
+  .map((pluginId) => plugins.value.find((plugin) => plugin.plugin_id === pluginId))
+  .filter((plugin): plugin is MarketPlugin => Boolean(plugin)))
+const isBatchActive = computed(() => (
+  batchOperation.value?.status === 'queued' || batchOperation.value?.status === 'running'
+))
+const batchInstallEnabled = computed(() => capabilities.value?.install_enabled === true)
 
 const categoryOptions = computed<SelectOption[]>(() => [
   { label: t('pluginMarket.filters.allCategories'), value: '' },
@@ -101,6 +128,115 @@ function clearSearch(): void {
   searchQuery.value = ''
 }
 
+function isSelectable(plugin: MarketPlugin): boolean {
+  return !plugin.local_state.installed || plugin.local_state.update_available
+}
+
+function toggleBatchMode(): void {
+  if (isBatchActive.value || !batchInstallEnabled.value) return
+  batchMode.value = !batchMode.value
+  if (!batchMode.value) selectedPluginIds.value = []
+}
+
+function togglePluginSelection(pluginId: string): void {
+  const plugin = plugins.value.find((item) => item.plugin_id === pluginId)
+  if (!plugin || !isSelectable(plugin) || isBatchActive.value) return
+  selectedPluginIds.value = selectedPluginIds.value.includes(pluginId)
+    ? selectedPluginIds.value.filter((id) => id !== pluginId)
+    : [...selectedPluginIds.value, pluginId]
+}
+
+function planSummary(plan: BatchInstallPlan): string {
+  const runnable = plan.items.filter((item) => item.can_install)
+  const blocked = plan.items.filter((item) => !item.can_install)
+  const selected = runnable.filter((item) => item.source === 'selected')
+  const dependencies = runnable.filter((item) => item.source === 'dependency')
+  const lines = [
+    t('pluginMarket.batch.planSelected', { count: String(selected.length) }),
+    ...selected.map((item) => (
+      `- ${item.display_name} (${item.action === 'update'
+        ? t('pluginMarket.batch.update')
+        : t('pluginMarket.batch.install')}) v${item.version?.version ?? '—'}`
+    )),
+  ]
+  if (dependencies.length) {
+    lines.push('', t('pluginMarket.batch.planDependencies', { count: String(dependencies.length) }))
+    lines.push(...dependencies.map((item) => `- ${item.display_name} v${item.version?.version ?? '—'}`))
+  }
+  if (blocked.length) {
+    lines.push('', t('pluginMarket.batch.planBlocked', { count: String(blocked.length) }))
+    lines.push(...blocked.map((item) => (
+      `- ${item.display_name}: ${item.blocking_reasons.join('；')}`
+    )))
+  }
+  const warnings = runnable.flatMap((item) => (
+    item.warnings.map((warning) => `${item.display_name}: ${warning}`)
+  ))
+  if (warnings.length) {
+    lines.push('', t('pluginMarket.batch.planWarnings'), ...warnings.map((warning) => `- ${warning}`))
+  }
+  return lines.join('\n')
+}
+
+async function openBatchInstallPlan(): Promise<void> {
+  if (
+    !batchInstallEnabled.value
+    || !batchSelectionCount.value
+    || isPlanningBatch.value
+    || isBatchActive.value
+  ) return
+
+  isPlanningBatch.value = true
+  try {
+    const plan = await getBatchMarketInstallPlan(selectedPluginIds.value)
+    const confirmed = await dialog.confirm(
+      planSummary(plan),
+      t('pluginMarket.batch.planTitle'),
+      t('pluginMarket.batch.confirmInstall'),
+      t('pluginMarket.batch.cancel'),
+    )
+    if (!confirmed || !plan.can_install) return
+    batchOperation.value = await startBatchMarketInstall(selectedPluginIds.value)
+    void pollBatchOperation(batchOperation.value.operation_id)
+  } catch (error: unknown) {
+    await dialog.alert(errorText(error), t('pluginMarket.batch.errorTitle'))
+  } finally {
+    isPlanningBatch.value = false
+  }
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds))
+}
+
+async function pollBatchOperation(operationId: string): Promise<void> {
+  try {
+    while (true) {
+      const operation = await getBatchMarketOperation(operationId)
+      batchOperation.value = operation
+      if (!['queued', 'running'].includes(operation.status)) {
+        const restartRequired = operation.items.some((item) => item.restart_required)
+        const result = [
+          operation.message,
+          t('pluginMarket.batch.resultCounts', {
+            success: String(operation.success_count),
+            failed: String(operation.failed_count),
+            skipped: String(operation.skipped_count),
+          }),
+          restartRequired ? t('pluginMarket.batch.restartRequired') : '',
+        ].filter(Boolean).join('\n')
+        await dialog.alert(result, t('pluginMarket.batch.resultTitle'))
+        selectedPluginIds.value = []
+        await loadPlugins(true)
+        return
+      }
+      await wait(1200)
+    }
+  } catch (error: unknown) {
+    await dialog.alert(errorText(error), t('pluginMarket.batch.errorTitle'))
+  }
+}
+
 async function closeDetail(): Promise<void> {
   if (window.history.state?.fromPluginMarketList === true) {
     router.back()
@@ -139,6 +275,9 @@ function errorText(error: unknown): string {
 
 onMounted(() => {
   void loadPlugins()
+  void getMarketCapabilities()
+    .then((result) => { capabilities.value = result })
+    .catch(() => { capabilities.value = null })
 })
 </script>
 
@@ -241,11 +380,123 @@ onMounted(() => {
             </span>
           </div>
 
+          <label class="batch-mode-option">
+            <input
+              type="checkbox"
+              :checked="batchMode"
+              :disabled="!batchInstallEnabled || isBatchActive"
+              @change="toggleBatchMode"
+            />
+            <span>{{ t('pluginMarket.batch.mode') }}</span>
+          </label>
+
+          <aside
+            v-if="batchMode"
+            class="batch-action-bar"
+            :class="{ active: isBatchActive }"
+            :aria-busy="isBatchActive"
+          >
+            <template v-if="isBatchActive && batchOperation">
+              <div class="batch-operation-panel" :class="batchOperation.status">
+                <div class="batch-operation-heading">
+                  <Icon
+                    :icon="batchOperation.status === 'failed'
+                      ? 'material-symbols:error-outline-rounded'
+                      : 'material-symbols:sync-rounded'"
+                    width="22"
+                    height="22"
+                    class="spinning"
+                  />
+                  <div>
+                    <strong>{{ batchOperation.message }}</strong>
+                    <span>
+                      {{ t('pluginMarket.batch.resultCounts', {
+                        success: String(batchOperation.success_count),
+                        failed: String(batchOperation.failed_count),
+                        skipped: String(batchOperation.skipped_count),
+                      }) }}
+                    </span>
+                  </div>
+                  <em>{{ batchOperation.progress }}%</em>
+                </div>
+                <div
+                  class="batch-progress-track"
+                  role="progressbar"
+                  :aria-valuenow="batchOperation.progress"
+                  aria-valuemin="0"
+                  aria-valuemax="100"
+                >
+                  <span :style="{ width: `${batchOperation.progress}%` }"></span>
+                </div>
+              </div>
+            </template>
+            <template v-else>
+              <div class="batch-selection-content">
+                <div
+                  class="batch-chip-picker"
+                  :aria-label="t('pluginMarket.batch.selectionCount', {
+                    count: String(batchSelectionCount),
+                  })"
+                >
+                  <span v-if="!selectedPlugins.length" class="batch-chip-placeholder">
+                    {{ t('pluginMarket.batch.selectHint') }}
+                  </span>
+                  <button
+                    v-for="plugin in selectedPlugins"
+                    :key="plugin.plugin_id"
+                    class="batch-selection-chip"
+                    type="button"
+                    :title="t('pluginMarket.batch.deselectPlugin', { name: plugin.display_name })"
+                    @click="togglePluginSelection(plugin.plugin_id)"
+                  >
+                    <span>{{ plugin.display_name }}</span>
+                    <Icon icon="material-symbols:close-rounded" width="17" height="17" />
+                  </button>
+                </div>
+                <small>{{ t('pluginMarket.batch.latestHint') }}</small>
+              </div>
+              <div class="batch-actions">
+                <button
+                  class="text-button"
+                  type="button"
+                  :disabled="!batchSelectionCount"
+                  @click="selectedPluginIds = []"
+                >
+                  {{ t('pluginMarket.batch.clearSelection') }}
+                </button>
+                <button
+                  class="primary-button batch-install-button"
+                  type="button"
+                  :disabled="!batchInstallEnabled || !batchSelectionCount || isPlanningBatch"
+                  @click="openBatchInstallPlan"
+                >
+                  <Icon
+                    :icon="isPlanningBatch
+                      ? 'material-symbols:progress-activity-rounded'
+                      : 'material-symbols:download-rounded'"
+                    width="19"
+                    height="19"
+                    :class="{ spinning: isPlanningBatch }"
+                  />
+                  {{ isPlanningBatch
+                    ? t('pluginMarket.batch.planning')
+                    : t('pluginMarket.batch.installSelected', {
+                      count: String(batchSelectionCount),
+                    }) }}
+                </button>
+              </div>
+            </template>
+          </aside>
+
           <div v-if="visiblePlugins.length" class="plugin-grid">
             <PluginMarketCard
               v-for="plugin in visiblePlugins"
               :key="plugin.plugin_id"
               :plugin="plugin"
+              :selection-mode="batchMode"
+              :selected="selectedPluginIds.includes(plugin.plugin_id)"
+              :selectable="isSelectable(plugin) && !isBatchActive"
+              @toggle-selection="togglePluginSelection"
             />
           </div>
 
@@ -267,6 +518,186 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+.text-button {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: 8px;
+  color: var(--md-sys-color-on-surface);
+  background: var(--md-sys-color-surface-container-low);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.text-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.batch-mode-option {
+  width: fit-content;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  color: var(--md-sys-color-on-surface);
+  font-size: 0.86rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.batch-mode-option input {
+  width: 18px;
+  height: 18px;
+  margin: 0;
+  accent-color: var(--md-sys-color-primary);
+  cursor: pointer;
+}
+
+.batch-mode-option input:disabled {
+  cursor: not-allowed;
+}
+
+.batch-action-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0 0 1rem;
+  padding: 12px 14px;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: 8px;
+  background: var(--md-sys-color-surface-container-low);
+}
+
+.batch-action-bar.active {
+  display: block;
+  padding: 13px 14px;
+}
+
+.batch-selection-content {
+  min-width: 0;
+  flex: 1;
+  display: grid;
+  gap: 7px;
+}
+
+.batch-selection-content small {
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 0.76rem;
+}
+
+.batch-chip-picker {
+  min-height: 48px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 10px;
+  border: 1px solid var(--md-sys-color-outline-variant);
+  border-radius: 8px;
+  background: var(--md-sys-color-surface-container);
+}
+
+.batch-chip-placeholder {
+  padding: 0 4px;
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 0.84rem;
+}
+
+.batch-selection-chip {
+  min-width: 0;
+  max-width: 260px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px 5px 10px;
+  border: 0;
+  border-radius: 9999px;
+  color: var(--md-sys-color-on-surface);
+  background: var(--md-sys-color-surface-container-highest);
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.batch-selection-chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.batch-selection-chip:hover {
+  color: var(--md-sys-color-on-error-container);
+  background: var(--md-sys-color-error-container);
+}
+
+.batch-actions {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  flex: 0 0 auto;
+}
+
+.batch-actions > button {
+  height: 56px;
+  min-height: 56px;
+  margin-top: 0;
+  box-sizing: border-box;
+}
+
+.batch-install-button {
+  margin-top: 0;
+}
+
+.batch-operation-panel {
+  color: var(--md-sys-color-on-surface);
+}
+
+.batch-operation-heading {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+}
+
+.batch-operation-heading div {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.batch-operation-heading span,
+.batch-operation-heading em {
+  color: var(--md-sys-color-on-surface-variant);
+  font-size: 0.76rem;
+  font-style: normal;
+  overflow-wrap: anywhere;
+}
+
+.batch-progress-track {
+  height: 5px;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 9999px;
+  background: var(--md-sys-color-surface-container-highest);
+}
+
+.batch-progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--md-sys-color-primary);
+  transition: width 0.25s ease;
 }
 
 .market-header {
@@ -476,6 +907,10 @@ onMounted(() => {
 }
 
 .spinning {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transform-origin: center;
   animation: spin 0.8s linear infinite;
 }
 
@@ -517,6 +952,16 @@ onMounted(() => {
 }
 
 @media (max-width: 480px) {
+  .batch-action-bar,
+  .batch-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .batch-actions > * {
+    width: 100%;
+  }
+
   .market-header {
     padding-top: 1rem;
   }

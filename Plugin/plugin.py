@@ -48,9 +48,9 @@ class WebuiPlugin(BasePlugin):
     - 插件 UI 扩展系统
     """
 
-    plugin_name: str = "neo-mofox-webui"
-    plugin_description: str = "Neo-MoFox WebUI 后端插件"
-    plugin_version: str = "1.0.18-dev"
+    plugin_name: str = "neo-mofox-webui-extra"
+    plugin_description: str = "Neo-MoFox WebUI 扩展版本"
+    plugin_version: str = "1.0.18"
 
     configs: list[type] = []
     dependent_components: list[str] = []

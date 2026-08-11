@@ -97,7 +97,7 @@ class McpConfigManager:
         initialize_request = (
             '{"jsonrpc":"2.0","id":1,"method":"initialize",'
             '"params":{"protocolVersion":"2024-11-05","capabilities":{},'
-            '"clientInfo":{"name":"neo-mofox-webui","version":"1.0.0"}}}\n'
+            '"clientInfo":{"name":"neo-mofox-webui-extra","version":"1.0.18"}}}\n'
         )
 
         try:

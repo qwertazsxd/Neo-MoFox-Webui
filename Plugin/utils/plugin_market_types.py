@@ -221,6 +221,78 @@ class MarketOperation(BaseModel):
     result: MarketOperationResult | None = Field(default=None, description="成功后的结构化结果")
 
 
+# 批量安装使用独立状态，避免改变已有单插件操作的接口契约。
+BatchOperationStatus = Literal["queued", "running", "succeeded", "partial_failed", "failed"]
+BatchItemStatus = Literal["planned", "running", "succeeded", "failed", "skipped", "blocked"]
+BatchItemSource = Literal["selected", "dependency"]
+
+
+class BatchInstallRequest(BaseModel):
+    """批量安装预检或启动请求。"""
+
+    plugin_ids: list[str] = Field(
+        min_length=1,
+        max_length=50,
+        description="用户在市场首页勾选的插件唯一标识；服务端会去重并重新校验",
+    )
+
+
+class BatchInstallPlanItem(BaseModel):
+    """批量计划中的单个插件（可能是用户勾选项或自动依赖）。"""
+
+    plugin_id: str = Field(description="插件唯一标识")
+    display_name: str = Field(description="供前端展示的名称")
+    plugin: MarketPlugin | None = Field(default=None, description="可取得时的完整市场元数据")
+    version: MarketVersion | None = Field(default=None, description="实际目标版本；解析失败时为空")
+    action: Literal["install", "update"] | None = Field(default=None, description="写入动作")
+    source: BatchItemSource = Field(description="用户勾选项或自动补齐的依赖")
+    dependencies: list[str] = Field(default_factory=list, description="本批次中必须先完成的依赖插件")
+    can_install: bool = Field(description="该项是否可在当前批次执行")
+    blocking_reasons: list[str] = Field(default_factory=list, description="阻止该项执行的原因")
+    warnings: list[str] = Field(default_factory=list, description="需要用户确认的非阻塞风险")
+
+
+class BatchInstallPlan(BaseModel):
+    """确认前展示的批量安装/更新计划。"""
+
+    requested_plugin_ids: list[str] = Field(description="去重后的用户勾选插件")
+    items: list[BatchInstallPlanItem] = Field(description="按依赖优先顺序排列的完整计划")
+    can_install: bool = Field(description="是否至少有一个项目可以启动")
+    warnings: list[str] = Field(default_factory=list, description="整批次风险提示")
+
+
+class BatchOperationItem(BaseModel):
+    """批量后台任务中一个插件的实时执行状态。"""
+
+    plugin_id: str = Field(description="插件唯一标识")
+    display_name: str = Field(description="供前端展示的名称")
+    version: str | None = Field(default=None, description="目标版本")
+    action: Literal["install", "update"] | None = Field(default=None, description="写入动作")
+    source: BatchItemSource = Field(description="用户勾选项或自动依赖")
+    dependencies: list[str] = Field(default_factory=list, description="本批次依赖")
+    status: BatchItemStatus = Field(description="单项执行状态")
+    message: str = Field(default="", description="供界面展示的状态说明")
+    error_message: str | None = Field(default=None, description="失败或阻止原因")
+    restart_required: bool = Field(default=False, description="该项是否需要重启后生效")
+
+
+class BatchMarketOperation(BaseModel):
+    """可轮询的批量安装后台任务。"""
+
+    operation_id: str = Field(description="批量任务唯一标识")
+    status: BatchOperationStatus = Field(description="批量任务最终或当前状态")
+    stage: str = Field(description="当前业务阶段")
+    progress: int = Field(ge=0, le=100, description="总体进度百分比")
+    message: str = Field(description="当前状态说明")
+    created_at: str = Field(description="任务创建时间")
+    updated_at: str = Field(description="任务最后更新时间")
+    requested_count: int = Field(ge=0, description="用户勾选数量")
+    success_count: int = Field(ge=0, description="成功数量")
+    failed_count: int = Field(ge=0, description="失败数量")
+    skipped_count: int = Field(ge=0, description="跳过或预检阻止数量")
+    items: list[BatchOperationItem] = Field(description="逐项状态")
+
+
 class UpstreamPluginList(BaseModel):
     """官方市场列表原始响应。"""
 
@@ -250,6 +322,14 @@ class UpstreamInstallInfo(BaseModel):
 
 
 __all__ = [
+    "BatchInstallPlan",
+    "BatchInstallPlanItem",
+    "BatchInstallRequest",
+    "BatchItemSource",
+    "BatchItemStatus",
+    "BatchMarketOperation",
+    "BatchOperationItem",
+    "BatchOperationStatus",
     "CompatibilityInfo",
     "InstallPlan",
     "InstallPlanRequest",

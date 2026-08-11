@@ -8,10 +8,12 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import sys
+import time
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -23,7 +25,7 @@ logger = get_logger("webui.log_manager", display="WebUI.LogManager")
 DEFAULT_LOG_DIR = Path("logs")
 
 # 实时日志缓冲区大小
-LOG_BUFFER_SIZE = 200
+LOG_BUFFER_SIZE = 1000
 
 LOG_LINE_PATTERNS = (
     re.compile(
@@ -67,6 +69,17 @@ LEVEL_STYLE_MAP: dict[str, tuple[str, str, str]] = {
     "CRITICAL": ("critical", "#9f1239", "严重"),
     "FATAL": ("critical", "#9f1239", "致命"),
 }
+
+PLUGIN_IDENTIFIER_SEPARATOR = re.compile(r"[\W_]+", re.UNICODE)
+PLUGIN_METADATA_KEYS = (
+    "plugin_name",
+    "plugin",
+    "plugin_id",
+    "pluginName",
+)
+PLUGIN_NAMESPACE_PREFIXES = frozenset({"neo", "mofox"})
+MIN_PLUGIN_ACRONYM_LENGTH = 3
+PLUGIN_LOGGER_ALIAS_REFRESH_INTERVAL = 1.0
 
 
 class LogEntry(BaseModel):
@@ -185,6 +198,10 @@ class LogManager:
         self._lock = asyncio.Lock()
         self._log_dir = Path(log_dir)
 
+    _plugin_logger_alias_cache: ClassVar[
+        dict[str, tuple[str, int, float, frozenset[str]]]
+    ] = {}
+
     async def push_log(self, log_data: dict[str, Any]) -> None:
         """推送一条日志到缓冲区并广播给所有客户端。
 
@@ -230,13 +247,172 @@ class LogManager:
         async with self._lock:
             self._clients.discard(queue)
 
-    def get_buffer(self) -> list[dict[str, Any]]:
-        """获取当前缓冲区中的所有日志。
+    @staticmethod
+    def _normalize_plugin_identifier(value: Any) -> str:
+        """将插件名和 logger 名规范化为可比较的点分标识符。"""
+        if not isinstance(value, str):
+            return ""
+
+        normalized = PLUGIN_IDENTIFIER_SEPARATOR.sub(".", value.casefold()).strip(".")
+        return normalized
+
+    @classmethod
+    def _plugin_identifier_aliases(cls, plugin_name: str) -> set[str]:
+        """Return conservative aliases for plugins with abbreviated logger names.
+
+        A number of existing plugins use an acronym (for example ``NFC`` for
+        ``neo_fatum_chatter``) or omit the conventional ``neo``/``mofox``
+        namespace from their logger names.  These aliases are still matched as
+        complete identifiers or namespace prefixes, never as substrings.
+        """
+        normalized = cls._normalize_plugin_identifier(plugin_name)
+        if not normalized:
+            return set()
+
+        tokens = [token for token in normalized.split(".") if token]
+        aliases = {normalized}
+
+        acronym = "".join(token[0] for token in tokens)
+        if len(acronym) >= MIN_PLUGIN_ACRONYM_LENGTH:
+            aliases.add(acronym)
+
+        meaningful_tokens = list(tokens)
+        while meaningful_tokens and meaningful_tokens[0] in PLUGIN_NAMESPACE_PREFIXES:
+            meaningful_tokens.pop(0)
+        if meaningful_tokens and meaningful_tokens != tokens:
+            aliases.add(".".join(meaningful_tokens))
+            meaningful_acronym = "".join(token[0] for token in meaningful_tokens)
+            if len(meaningful_acronym) >= MIN_PLUGIN_ACRONYM_LENGTH:
+                aliases.add(meaningful_acronym)
+
+        return aliases
+
+    @classmethod
+    def _runtime_plugin_logger_aliases(cls, plugin_name: str) -> set[str]:
+        """Discover logger names exported by the loaded plugin modules.
+
+        The core log event contains logger metadata but not the originating
+        Python module.  Existing plugins often use names such as
+        ``video_handler`` that cannot be inferred from the manifest name.  A
+        loaded plugin class gives us its package prefix, so we can inspect the
+        already-imported modules under that prefix and collect their Logger
+        instances without broad message matching.
+        """
+        try:
+            from src.core.components.loader import get_plugin_class
+
+            plugin_class = get_plugin_class(plugin_name)
+        except Exception:
+            return set()
+
+        if plugin_class is None:
+            return set()
+
+        module_name = str(getattr(plugin_class, "__module__", "") or "")
+        package_name = module_name.rsplit(".", 1)[0] if "." in module_name else ""
+        if not package_name:
+            return set()
+
+        now = time.monotonic()
+        cached = cls._plugin_logger_alias_cache.get(plugin_name)
+        if (
+            cached
+            and cached[0] == package_name
+            and cached[1] == id(plugin_class)
+            and now - cached[2] < PLUGIN_LOGGER_ALIAS_REFRESH_INTERVAL
+        ):
+            return set(cached[3])
+
+        module_names = tuple(
+            name
+            for name in sys.modules
+            if name == package_name or name.startswith(f"{package_name}.")
+        )
+        aliases: set[str] = set()
+        for imported_name in module_names:
+            module = sys.modules.get(imported_name)
+            if module is None:
+                continue
+            for value in vars(module).values():
+                value_type = type(value)
+                if not value_type.__module__.startswith("src.kernel.logger"):
+                    continue
+                for field_name in ("name", "display"):
+                    value_name = getattr(value, field_name, None)
+                    normalized_value = cls._normalize_plugin_identifier(value_name)
+                    if normalized_value:
+                        aliases.add(normalized_value)
+
+        frozen_aliases = frozenset(aliases)
+        cls._plugin_logger_alias_cache[plugin_name] = (
+            package_name,
+            id(plugin_class),
+            now,
+            frozen_aliases,
+        )
+        return set(frozen_aliases)
+
+    @staticmethod
+    def _matches_identifier(candidate: str, identifiers: set[str]) -> bool:
+        return any(
+            candidate == identifier or candidate.startswith(f"{identifier}.")
+            for identifier in identifiers
+        )
+
+    @classmethod
+    def matches_plugin(cls, log_data: dict[str, Any], plugin_name: str | None) -> bool:
+        """判断日志是否明确属于指定插件。
+
+        metadata 中存在插件归属字段时以其为准；否则仅接受 logger/display
+        与插件名完全一致或使用插件名作为命名空间前缀的日志。
+        """
+        if not plugin_name:
+            return True
+
+        normalized_plugin = cls._normalize_plugin_identifier(plugin_name)
+        if not normalized_plugin:
+            return False
+        plugin_aliases = cls._plugin_identifier_aliases(plugin_name)
+
+        metadata = log_data.get("metadata")
+        if isinstance(metadata, dict):
+            metadata_candidates = [
+                metadata.get(key)
+                for key in PLUGIN_METADATA_KEYS
+                if isinstance(metadata.get(key), str) and metadata.get(key)
+            ]
+            if metadata_candidates:
+                return any(
+                    cls._normalize_plugin_identifier(candidate) == normalized_plugin
+                    for candidate in metadata_candidates
+                )
+
+        for field_name in ("logger_name", "display"):
+            normalized_candidate = cls._normalize_plugin_identifier(log_data.get(field_name))
+            if cls._matches_identifier(normalized_candidate, plugin_aliases):
+                return True
+
+        runtime_aliases = cls._runtime_plugin_logger_aliases(plugin_name)
+        for field_name in ("logger_name", "display"):
+            normalized_candidate = cls._normalize_plugin_identifier(log_data.get(field_name))
+            if cls._matches_identifier(normalized_candidate, runtime_aliases):
+                return True
+
+        return False
+
+    def get_buffer(self, plugin_name: str | None = None) -> list[dict[str, Any]]:
+        """获取当前缓冲区中的日志，可按插件归属过滤。
 
         Returns:
             缓冲区中的日志列表（按时间顺序）
         """
-        return list(self._buffer)
+        if not plugin_name:
+            return list(self._buffer)
+        return [
+            log_entry
+            for log_entry in self._buffer
+            if self.matches_plugin(log_entry, plugin_name)
+        ]
 
     def get_log_files(self) -> list[LogFileInfo]:
         """获取可用的历史日志文件列表。

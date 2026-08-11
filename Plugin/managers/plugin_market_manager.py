@@ -42,6 +42,10 @@ from src.kernel.concurrency import get_task_manager
 
 from ..storage.settings import SettingsStorage
 from ..utils.plugin_market_types import (
+    BatchInstallPlan,
+    BatchInstallPlanItem,
+    BatchMarketOperation,
+    BatchOperationItem,
     CompatibilityInfo,
     InstallPlan,
     MarketCapabilities,
@@ -115,6 +119,8 @@ class PluginMarketManager:
         # 任务状态会由请求协程和后台任务跨异步上下文访问，使用同步锁保护短临界区。
         self._operation_state_lock = Lock()
         self._operations: dict[str, MarketOperation] = {}
+        self._batch_operations: dict[str, BatchMarketOperation] = {}
+        self._batch_runtime_plans: dict[str, dict[str, InstallPlan]] = {}
 
     async def _get_market_settings(self):
         """读取当前 WebUI 设置中的插件市场子配置。"""
@@ -318,6 +324,484 @@ class PluginMarketManager:
         )
         return operation
 
+    async def create_batch_install_plan(self, plugin_ids: list[str]) -> BatchInstallPlan:
+        """为首页勾选项构建包含自动依赖的批量安装计划。"""
+        requested: list[str] = []
+        for plugin_id in plugin_ids:
+            self._validate_plugin_id(plugin_id)
+            if plugin_id not in requested:
+                requested.append(plugin_id)
+        if not requested:
+            raise PluginMarketError("请至少选择一个插件")
+        if len(requested) > 50:
+            raise PluginMarketError("一次最多安装或更新 50 个插件")
+
+        entries: dict[str, dict[str, Any]] = {}
+        visiting: list[str] = []
+
+        async def visit(
+            plugin_id: str,
+            source: str,
+            dependency_constraint: str | None = None,
+            required_version: str | None = None,
+        ) -> None:
+            if plugin_id in visiting:
+                cycle = visiting[visiting.index(plugin_id):] + [plugin_id]
+                message = "检测到循环依赖: " + " -> ".join(cycle)
+                for cycle_id in set(cycle):
+                    entry = entries.setdefault(
+                        cycle_id,
+                        self._batch_placeholder(cycle_id, source),
+                    )
+                    entry["blocking"].append(message)
+                return
+            existing = entries.get(plugin_id)
+            if existing is not None:
+                if source == "selected":
+                    existing["source"] = "selected"
+                return
+
+            entry = self._batch_placeholder(plugin_id, source)
+            entries[plugin_id] = entry
+            visiting.append(plugin_id)
+            try:
+                detail = await self.get_plugin_detail(plugin_id)
+                entry["detail"] = detail
+                entry["plugin"] = detail.plugin
+                entry["display_name"] = detail.plugin.display_name
+                if source == "selected":
+                    target_version = detail.plugin.latest_version
+                    if not target_version:
+                        entry["blocking"].append("市场未提供 latest_version")
+                    else:
+                        entry["target_version"] = target_version
+                else:
+                    version = self._select_dependency_version(
+                        detail,
+                        required_version or dependency_constraint,
+                    )
+                    if version is None:
+                        entry["blocking"].append("没有满足依赖版本约束的市场版本")
+                    else:
+                        entry["target_version"] = version.version
+
+                target_version = entry["target_version"]
+                if target_version:
+                    try:
+                        plan = await self.create_install_plan(plugin_id, target_version)
+                        # 单插件计划会阻止缺失依赖；批量模式负责自动补齐它们。
+                        blocking = [
+                            reason
+                            for reason in plan.blocking_reasons
+                            if not reason.startswith("缺少依赖插件:")
+                        ]
+                        entry["plan"] = plan
+                        entry["blocking"].extend(blocking)
+                        entry["warnings"].extend(plan.warnings)
+                    except PluginMarketError as error:
+                        entry["blocking"].append(str(error))
+
+                for dependency in detail.dependencies:
+                    if dependency.satisfied:
+                        continue
+                    dependency_id = dependency.plugin_id
+                    entry["dependencies"].append(dependency_id)
+                    if not dependency.exists_in_market:
+                        entry["blocking"].append(
+                            f"缺少市场依赖插件: {dependency_id}"
+                        )
+                        continue
+                    await visit(
+                        dependency_id,
+                        "dependency",
+                        dependency.version_constraint,
+                        dependency.required_version,
+                    )
+            except PluginMarketError as error:
+                entry["blocking"].append(str(error))
+            finally:
+                if visiting and visiting[-1] == plugin_id:
+                    visiting.pop()
+                elif plugin_id in visiting:
+                    visiting.remove(plugin_id)
+
+        for plugin_id in requested:
+            await visit(plugin_id, "selected")
+
+        ordered: list[str] = []
+        ordered_seen: set[str] = set()
+
+        def append_in_dependency_order(plugin_id: str) -> None:
+            if plugin_id in ordered_seen:
+                return
+            ordered_seen.add(plugin_id)
+            for dependency_id in entries.get(plugin_id, {}).get("dependencies", []):
+                if dependency_id in entries:
+                    append_in_dependency_order(dependency_id)
+            ordered.append(plugin_id)
+
+        for plugin_id in requested:
+            append_in_dependency_order(plugin_id)
+        for plugin_id in entries:
+            append_in_dependency_order(plugin_id)
+
+        # 任何不可执行依赖都会阻止其所有直接或间接依赖者。
+        changed = True
+        while changed:
+            changed = False
+            for plugin_id in ordered:
+                entry = entries[plugin_id]
+                for dependency_id in entry["dependencies"]:
+                    dependency = entries.get(dependency_id)
+                    if dependency is None or dependency["blocking"]:
+                        reason = f"依赖插件 {dependency_id} 无法在本批次完成"
+                        if reason not in entry["blocking"]:
+                            entry["blocking"].append(reason)
+                            changed = True
+
+        items: list[BatchInstallPlanItem] = []
+        for plugin_id in ordered:
+            entry = entries[plugin_id]
+            plan: InstallPlan | None = entry.get("plan")
+            items.append(
+                BatchInstallPlanItem(
+                    plugin_id=plugin_id,
+                    display_name=entry["display_name"],
+                    plugin=entry.get("plugin"),
+                    version=plan.version if plan else None,
+                    action=plan.action if plan else None,
+                    source=entry["source"],
+                    dependencies=entry["dependencies"],
+                    can_install=bool(plan) and not entry["blocking"],
+                    blocking_reasons=list(dict.fromkeys(entry["blocking"])),
+                    warnings=list(dict.fromkeys(entry["warnings"])),
+                )
+            )
+        return BatchInstallPlan(
+            requested_plugin_ids=requested,
+            items=items,
+            can_install=any(item.can_install for item in items),
+            warnings=[],
+        )
+
+    async def start_batch_install(self, plugin_ids: list[str]) -> BatchMarketOperation:
+        """重新计算计划并创建串行批量安装任务。"""
+        plan = await self.create_batch_install_plan(plugin_ids)
+        runtime_plans: dict[str, InstallPlan] = {}
+        operation_items: list[BatchOperationItem] = []
+        for item in plan.items:
+            can_install = item.can_install
+            blocking = list(item.blocking_reasons)
+            if can_install and self._has_active_operation(item.plugin_id):
+                can_install = False
+                blocking.append(f"插件 {item.plugin_id} 已有操作正在执行")
+            if (
+                can_install
+                and item.plugin is not None
+                and item.version is not None
+                and item.action is not None
+            ):
+                runtime_plans[item.plugin_id] = InstallPlan(
+                    plugin=item.plugin,
+                    version=item.version,
+                    dependencies=[],
+                    action=item.action,
+                    can_install=True,
+                    blocking_reasons=[],
+                    warnings=item.warnings,
+                )
+            operation_items.append(
+                BatchOperationItem(
+                    plugin_id=item.plugin_id,
+                    display_name=item.display_name,
+                    version=item.version.version if item.version else None,
+                    action=item.action,
+                    source=item.source,
+                    dependencies=item.dependencies,
+                    status="planned" if can_install else "blocked",
+                    message="等待安装" if can_install else "预检未通过",
+                    error_message="；".join(blocking) if blocking else None,
+                )
+            )
+        if not runtime_plans:
+            raise PluginMarketError("所选插件均无法安装或更新")
+
+        operation = self._new_batch_operation(
+            len(plan.requested_plugin_ids),
+            operation_items,
+        )
+        self._batch_runtime_plans[operation.operation_id] = runtime_plans
+        get_task_manager().create_task(
+            self._run_batch_install(operation.operation_id),
+            name=f"plugin-market-batch-install-{operation.operation_id}",
+            timeout=float(_REQUEST_TIMEOUT_SECONDS + 180) * max(1, len(runtime_plans)),
+            metadata={
+                "operation_id": operation.operation_id,
+                "plugin_ids": list(runtime_plans),
+            },
+        )
+        return operation
+
+    def get_batch_operation(self, operation_id: str) -> BatchMarketOperation:
+        """返回批量安装任务的状态快照。"""
+        with self._operation_state_lock:
+            operation = self._batch_operations.get(operation_id)
+            if operation is None:
+                raise PluginMarketError("批量操作记录不存在或已过期")
+            return operation.model_copy(deep=True)
+
+    async def _run_batch_install(self, operation_id: str) -> None:
+        """持有全局写锁按依赖顺序执行一批插件，失败不影响独立项。"""
+        async with self._operation_lock:
+            try:
+                self._update_batch_operation(
+                    operation_id,
+                    status="running",
+                    stage="installing",
+                    message="正在安装插件",
+                )
+                runtime_plans = self._batch_runtime_plans.get(operation_id, {})
+                current = self.get_batch_operation(operation_id)
+                total = len(current.items)
+                for index, item in enumerate(current.items):
+                    if item.status != "planned":
+                        continue
+                    latest = self.get_batch_operation(operation_id)
+                    dependency_states = {
+                        entry.plugin_id: entry.status for entry in latest.items
+                    }
+                    failed_dependency = next(
+                        (
+                            dependency_id
+                            for dependency_id in item.dependencies
+                            if dependency_states.get(dependency_id)
+                            in {"failed", "skipped", "blocked"}
+                        ),
+                        None,
+                    )
+                    if failed_dependency:
+                        self._update_batch_item(
+                            operation_id,
+                            item.plugin_id,
+                            status="skipped",
+                            message="依赖安装失败，已跳过",
+                            error_message=f"依赖插件 {failed_dependency} 未成功完成",
+                        )
+                        self._refresh_batch_counts(operation_id, index + 1, total)
+                        continue
+                    install_plan = runtime_plans.get(item.plugin_id)
+                    if install_plan is None:
+                        self._update_batch_item(
+                            operation_id,
+                            item.plugin_id,
+                            status="skipped",
+                            message="没有可执行的安装计划",
+                            error_message="安装计划已失效",
+                        )
+                        self._refresh_batch_counts(operation_id, index + 1, total)
+                        continue
+                    child = self._new_operation(
+                        item.plugin_id,
+                        "install",
+                        "等待安装",
+                        "批量安装任务已进入队列",
+                    )
+                    self._update_batch_item(
+                        operation_id,
+                        item.plugin_id,
+                        status="running",
+                        message="正在下载并安装",
+                    )
+                    self._update_batch_operation(
+                        operation_id,
+                        stage="installing",
+                        message=f"正在处理 {item.display_name}",
+                        progress=min(99, int(index * 100 / max(total, 1))),
+                    )
+                    await self._execute_install(child.operation_id, install_plan)
+                    child_state = self.get_operation(child.operation_id)
+                    if child_state.status == "succeeded":
+                        self._update_batch_item(
+                            operation_id,
+                            item.plugin_id,
+                            status="succeeded",
+                            message=child_state.message,
+                            restart_required=bool(
+                                child_state.result
+                                and child_state.result.restart_required
+                            ),
+                        )
+                    else:
+                        self._update_batch_item(
+                            operation_id,
+                            item.plugin_id,
+                            status="failed",
+                            message=child_state.message,
+                            error_message=child_state.error_message or "安装失败",
+                        )
+                    self._refresh_batch_counts(operation_id, index + 1, total)
+
+                completed = self.get_batch_operation(operation_id)
+                if completed.success_count == 0:
+                    status = "failed"
+                    message = "批量安装未完成任何插件"
+                elif completed.failed_count or completed.skipped_count:
+                    status = "partial_failed"
+                    message = "批量安装已完成，但部分插件未成功"
+                else:
+                    status = "succeeded"
+                    message = "批量安装完成"
+                self._update_batch_operation(
+                    operation_id,
+                    status=status,
+                    stage="completed",
+                    progress=100,
+                    message=message,
+                )
+                self._cache = None
+            except Exception as error:
+                logger.error(f"批量市场安装失败: {error}", exc_info=True)
+                self._update_batch_operation(
+                    operation_id,
+                    status="failed",
+                    stage="failed",
+                    message="批量安装失败",
+                    error_message=str(error),
+                )
+            finally:
+                self._batch_runtime_plans.pop(operation_id, None)
+
+    @staticmethod
+    def _batch_placeholder(plugin_id: str, source: str) -> dict[str, Any]:
+        return {
+            "source": source,
+            "display_name": plugin_id,
+            "plugin": None,
+            "detail": None,
+            "target_version": None,
+            "plan": None,
+            "dependencies": [],
+            "blocking": [],
+            "warnings": [],
+        }
+
+    @staticmethod
+    def _select_dependency_version(
+        detail: MarketPluginDetail,
+        constraint: str | None,
+    ) -> MarketVersion | None:
+        normalized_constraint = constraint
+        if normalized_constraint and not normalized_constraint.lstrip().startswith(
+            ("===", "==", "!=", "~=", ">=", "<=", ">", "<")
+        ):
+            normalized_constraint = "==" + normalized_constraint
+        candidates = [
+            version
+            for version in detail.versions
+            if version.status == "published"
+            and not version.is_yanked
+            and PluginMarketManager._version_satisfies(
+                version.version,
+                normalized_constraint,
+            )
+        ]
+        if not candidates:
+            return None
+
+        def sort_key(version: MarketVersion) -> tuple[int, Version | str]:
+            try:
+                return (1, Version(version.version))
+            except InvalidVersion:
+                return (0, version.version)
+
+        return max(candidates, key=sort_key)
+
+    def _has_active_operation(self, plugin_id: str) -> bool:
+        with self._operation_state_lock:
+            return any(
+                item.plugin_id == plugin_id
+                and item.status in {"queued", "running"}
+                for item in self._operations.values()
+            )
+
+    def _new_batch_operation(
+        self,
+        requested_count: int,
+        items: list[BatchOperationItem],
+    ) -> BatchMarketOperation:
+        now = self._now()
+        operation = BatchMarketOperation(
+            operation_id=str(uuid4()),
+            status="queued",
+            stage="queued",
+            progress=0,
+            message="批量安装任务已进入队列",
+            created_at=now,
+            updated_at=now,
+            requested_count=requested_count,
+            success_count=0,
+            failed_count=0,
+            skipped_count=sum(
+                1 for item in items if item.status in {"blocked", "skipped"}
+            ),
+            items=items,
+        )
+        with self._operation_state_lock:
+            self._batch_operations[operation.operation_id] = operation
+            if len(self._batch_operations) > 100:
+                finished = [
+                    key
+                    for key, value in self._batch_operations.items()
+                    if value.status in {"succeeded", "partial_failed", "failed"}
+                ]
+                for key in finished[: len(self._batch_operations) - 100]:
+                    self._batch_operations.pop(key, None)
+        return operation.model_copy(deep=True)
+
+    def _update_batch_operation(self, operation_id: str, **updates: Any) -> None:
+        with self._operation_state_lock:
+            current = self._batch_operations[operation_id]
+            updates["updated_at"] = self._now()
+            self._batch_operations[operation_id] = current.model_copy(update=updates)
+
+    def _update_batch_item(
+        self,
+        operation_id: str,
+        plugin_id: str,
+        **updates: Any,
+    ) -> None:
+        with self._operation_state_lock:
+            current = self._batch_operations[operation_id]
+            items = list(current.items)
+            index = next(
+                index
+                for index, item in enumerate(items)
+                if item.plugin_id == plugin_id
+            )
+            items[index] = items[index].model_copy(update=updates)
+            self._batch_operations[operation_id] = current.model_copy(
+                update={"items": items, "updated_at": self._now()}
+            )
+
+    def _refresh_batch_counts(
+        self,
+        operation_id: str,
+        completed: int,
+        total: int,
+    ) -> None:
+        current = self.get_batch_operation(operation_id)
+        self._update_batch_operation(
+            operation_id,
+            progress=min(99, int(completed * 100 / max(total, 1))),
+            success_count=sum(
+                1 for item in current.items if item.status == "succeeded"
+            ),
+            failed_count=sum(1 for item in current.items if item.status == "failed"),
+            skipped_count=sum(
+                1 for item in current.items if item.status in {"blocked", "skipped"}
+            ),
+        )
+
     def get_operation(self, operation_id: str) -> MarketOperation:
         """读取可轮询的操作状态快照。
 
@@ -337,62 +821,66 @@ class PluginMarketManager:
             return operation.model_copy(deep=True)
 
     async def _run_install(self, operation_id: str, plan: InstallPlan) -> None:
-        """串行执行下载、校验、原子写入和热加载，并持续更新操作状态。"""
+        """串行执行单个安装任务。"""
         async with self._operation_lock:
-            try:
-                self._update_operation(
-                    operation_id,
-                    status="running",
-                    stage="downloading",
-                    progress=5,
-                    message="正在下载插件包",
+            await self._execute_install(operation_id, plan)
+
+    async def _execute_install(self, operation_id: str, plan: InstallPlan) -> None:
+        """在调用方已取得写锁时执行下载、校验、写入与热加载。"""
+        try:
+            self._update_operation(
+                operation_id,
+                status="running",
+                stage="downloading",
+                progress=5,
+                message="正在下载插件包",
+            )
+            destination = await self._download_and_store(
+                operation_id,
+                plan.plugin.plugin_id,
+                plan.version,
+                plan.plugin.local_state.plugin_path,
+            )
+            self._cache = None
+            self._update_operation(
+                operation_id,
+                stage="loading",
+                progress=92,
+                message="正在热加载插件",
+            )
+            loaded, load_message = await self._hot_load_plugin(
+                plan.plugin.plugin_id,
+                str(destination),
+                plan.plugin.local_state.loaded,
+            )
+            if loaded:
+                message = "插件已安装并加载完成"
+                restart_required = False
+            else:
+                message = (
+                    f"插件包已写入，热加载失败：{load_message}，请重启 Neo-MoFox 后生效"
                 )
-                destination = await self._download_and_store(
-                    operation_id,
-                    plan.plugin.plugin_id,
-                    plan.version,
-                    plan.plugin.local_state.plugin_path,
-                )
-                self._cache = None
-                self._update_operation(
-                    operation_id,
-                    stage="loading",
-                    progress=92,
-                    message="正在热加载插件",
-                )
-                loaded, load_message = await self._hot_load_plugin(
-                    plan.plugin.plugin_id,
-                    str(destination),
-                    plan.plugin.local_state.loaded,
-                )
-                if loaded:
-                    message = "插件已安装并加载完成"
-                    restart_required = False
-                else:
-                    message = (
-                        f"插件包已写入，热加载失败：{load_message}，请重启 Neo-MoFox 后生效"
-                    )
-                    restart_required = True
-                self._update_operation(
-                    operation_id,
-                    status="succeeded",
-                    stage="completed",
-                    progress=100,
-                    message=message,
-                    result=MarketOperationResult(
-                        plugin_id=plan.plugin.plugin_id,
-                        version=plan.version.version,
-                        restart_required=restart_required,
-                    ),
-                )
-                logger.warning(
-                    f"市场插件已写入: plugin={plan.plugin.plugin_id}, "
-                    f"version={plan.version.version}, path={destination}, "
-                    f"hot_loaded={loaded}"
-                )
-            except Exception as error:
-                logger.error(f"市场安装失败: {error}", exc_info=True)
-                self._fail_operation(operation_id, error)
+                restart_required = True
+            self._update_operation(
+                operation_id,
+                status="succeeded",
+                stage="completed",
+                progress=100,
+                message=message,
+                result=MarketOperationResult(
+                    plugin_id=plan.plugin.plugin_id,
+                    version=plan.version.version,
+                    restart_required=restart_required,
+                ),
+            )
+            logger.warning(
+                f"市场插件已写入: plugin={plan.plugin.plugin_id}, "
+                f"version={plan.version.version}, path={destination}, "
+                f"hot_loaded={loaded}"
+            )
+        except Exception as error:
+            logger.error(f"市场安装失败: {error}", exc_info=True)
+            self._fail_operation(operation_id, error)
 
     async def _hot_load_plugin(
         self,
@@ -564,7 +1052,7 @@ class PluginMarketManager:
         dependents: list[str],
     ) -> tuple[bool, str | None]:
         """判断本地插件是否满足市场覆盖白名单。"""
-        if plugin_id == "neo-mofox-webui":
+        if plugin_id in {"neo-mofox-webui", "neo-mofox-webui-extra"}:
             return False, "WebUI 插件不能从其自身市场中覆盖"
         root = self._plugins_root()
         if record.path.parent != root:
@@ -913,7 +1401,7 @@ class PluginMarketManager:
                 auto_decompress=False,
                 headers={
                     "Accept-Encoding": "identity",
-                    "User-Agent": "Neo-MoFox-WebUI-Plugin-Market/1.0.18-dev",
+                    "User-Agent": "Neo-MoFox-WebUI-Extra-Plugin-Market/1.0.18",
                 },
             ) as session:
                 for redirect_count in range(_MAX_REDIRECTS + 1):

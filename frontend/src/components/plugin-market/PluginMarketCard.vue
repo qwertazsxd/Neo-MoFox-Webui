@@ -6,6 +6,13 @@ import Icon from '../common/Icon.vue'
 
 const props = defineProps<{
   plugin: MarketPlugin
+  selectionMode?: boolean
+  selected?: boolean
+  selectable?: boolean
+}>()
+
+const emit = defineEmits<{
+  'toggle-selection': [pluginId: string]
 }>()
 
 const { t } = useI18n()
@@ -37,7 +44,19 @@ function formatCount(value: number): string {
 </script>
 
 <template>
-  <article class="market-card">
+  <article class="market-card" :class="{ selected: selectionMode && selected, 'selection-disabled': selectionMode && !selectable, 'selection-mode': selectionMode }">
+    <button
+      v-if="selectionMode"
+      class="selection-control"
+      type="button"
+      role="checkbox"
+      :aria-checked="Boolean(selected)"
+      :aria-label="selected ? t('pluginMarket.batch.deselectPlugin', { name: plugin.display_name }) : t('pluginMarket.batch.selectPlugin', { name: plugin.display_name })"
+      :disabled="!selectable"
+      @click.stop.prevent="emit('toggle-selection', plugin.plugin_id)"
+    >
+      <Icon :icon="selected ? 'material-symbols:check-circle-rounded' : 'material-symbols:radio-button-unchecked-rounded'" width="23" height="23" />
+    </button>
     <RouterLink class="card-link" :to="detailRoute">
       <header class="card-header">
         <div class="plugin-icon" aria-hidden="true">
@@ -99,6 +118,7 @@ function formatCount(value: number): string {
 
 <style scoped>
 .market-card {
+  position: relative;
   min-width: 0;
   min-height: 250px;
   border: 1px solid var(--md-sys-color-outline-variant);
@@ -106,6 +126,45 @@ function formatCount(value: number): string {
   background: color-mix(in srgb, var(--md-sys-color-surface-container-low) 92%, transparent);
   overflow: hidden;
   transition: border-color 0.18s, box-shadow 0.18s, transform 0.18s;
+}
+
+.market-card.selected {
+  border-color: var(--md-sys-color-primary);
+  box-shadow: 0 0 0 1px var(--md-sys-color-primary);
+}
+
+.market-card.selection-disabled {
+  opacity: 0.72;
+}
+
+.selection-control {
+  position: absolute;
+  top: 13px;
+  left: 17px;
+  z-index: 2;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  color: var(--md-sys-color-primary);
+  background: transparent;
+  cursor: pointer;
+}
+
+.market-card.selection-mode .card-link {
+  padding-top: 49px;
+}
+
+.selection-control:disabled {
+  color: var(--md-sys-color-on-surface-variant);
+  cursor: not-allowed;
+}
+
+.selection-control:focus-visible {
+  outline: 2px solid var(--md-sys-color-primary);
+  outline-offset: 2px;
 }
 
 .market-card:hover {

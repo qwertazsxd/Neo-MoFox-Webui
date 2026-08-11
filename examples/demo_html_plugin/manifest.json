@@ -4,8 +4,8 @@
     "description": "HTML 前端 UI 演示插件，展示 sys.* 桥接对象与 Web Components 的命令式用法",
     "author": "MoFox Team",
     "dependencies": {
-        "plugins": ["neo-mofox-webui"],
-        "components": ["neo-mofox-webui:service:plugin_ui"]
+        "plugins": ["neo-mofox-webui-extra"],
+        "components": ["neo-mofox-webui-extra:service:plugin_ui"]
     },
     "include": [
         {

@@ -3,6 +3,7 @@ import { ref, onMounted, computed, nextTick, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import AppShell from '../components/common/AppShell.vue'
 import Icon from '../components/common/Icon.vue'
+import PluginLogPanel from '../components/plugins/PluginLogPanel.vue'
 import { getPluginDetail, reloadPlugin, loadPlugin, unloadPlugin } from '../api/modules/plugin'
 import type { PluginDetail, PluginComponentInfo } from '../api/types/plugin'
 import { useDialogStore } from '../utils/dialog'
@@ -423,6 +424,8 @@ onMounted(async () => {
           </div>
         </div>
       </div>
+
+      <PluginLogPanel :plugin-name="pluginName" />
 
       <!-- 组件列表 -->
       <div class="components-section" :class="{ disabled: !plugin.is_loaded }">

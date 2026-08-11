@@ -1,6 +1,8 @@
 import http from '../base'
 import { API_WEBUI_PREFIX } from '../config'
 import type {
+  BatchInstallPlan,
+  BatchMarketOperation,
   InstallPlan,
   MarketCapabilities,
   MarketOperation,
@@ -50,4 +52,16 @@ export function startMarketInstall(
 
 export function getMarketOperation(operationId: string): Promise<MarketOperation> {
   return http.get(`${BASE}/operations/${encodeURIComponent(operationId)}`)
+}
+
+export function getBatchMarketInstallPlan(pluginIds: string[]): Promise<BatchInstallPlan> {
+  return http.post(`${BASE}/plugins/batch/install-plan`, { plugin_ids: pluginIds }, { timeout: 45000 })
+}
+
+export function startBatchMarketInstall(pluginIds: string[]): Promise<BatchMarketOperation> {
+  return http.post(`${BASE}/plugins/batch/install`, { plugin_ids: pluginIds })
+}
+
+export function getBatchMarketOperation(operationId: string): Promise<BatchMarketOperation> {
+  return http.get(`${BASE}/batch-operations/${encodeURIComponent(operationId)}`)
 }

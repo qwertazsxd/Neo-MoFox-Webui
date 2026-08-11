@@ -91,7 +91,7 @@ JSON，单一文件包含所有 locale。结构与 WebUI 内置 `messages` 一�
 ```python
 async def on_plugin_loaded(self) -> None:
     from src.app.plugin_system.api.service_api import get_service
-    service = get_service("neo-mofox-webui:service:plugin_ui")
+    service = get_service("neo-mofox-webui-extra:service:plugin_ui")
 
     await service.register_ui_page(
         plugin_name="my_plugin",
